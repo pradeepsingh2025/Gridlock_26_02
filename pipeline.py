@@ -6,6 +6,7 @@ import catboost as cb
 import optuna
 from sklearn.model_selection import KFold
 from sklearn.metrics import r2_score
+from sklearn.linear_model import Ridge
 from sklearn.preprocessing import LabelEncoder
 import warnings
 import json
@@ -127,64 +128,72 @@ def add_target_encoding(train_fe, test_fe, target, cols, n_folds=5):
     return train_fe, test_fe
 
 
-def add_geohash_aggregations(train_fe, test_fe, target):
+def add_geohash_aggregations(train_fe, test_fe, target, n_folds=5):
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=SEED)
     train_fe["_target"] = target.values
+    global_median = target.median()
 
-    geo_stats = train_fe.groupby("geohash_encoded")["_target"].agg(
-        ["mean", "std", "median", "min", "max", "count"]
-    ).reset_index()
-    geo_stats.columns = ["geohash_encoded", "geo_demand_mean", "geo_demand_std",
-                         "geo_demand_median", "geo_demand_min", "geo_demand_max", "geo_count"]
-    geo_stats["geo_demand_std"] = geo_stats["geo_demand_std"].fillna(0)
+    def calc_oof_stats(group_cols, stat_funcs, prefix):
+        stat_names = [f"{prefix}_{stat}" if stat != "count" else f"{prefix}_count" for stat in stat_funcs]
+        for col in stat_names:
+            train_fe[col] = np.nan
+            
+        for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(train_fe)):
+            tr_data = train_fe.iloc[tr_idx]
+            val_data = train_fe.iloc[val_idx]
+            stats = tr_data.groupby(group_cols)["_target"].agg(stat_funcs).reset_index()
+            stats.columns = group_cols + stat_names
+            val_merged = val_data[group_cols].merge(stats, on=group_cols, how="left")
+            for col in stat_names:
+                train_fe.loc[val_idx, col] = val_merged[col].values
+                
+        full_stats = train_fe.groupby(group_cols)["_target"].agg(stat_funcs).reset_index()
+        full_stats.columns = group_cols + stat_names
+        return full_stats, stat_names
 
-    train_fe = train_fe.merge(geo_stats, on="geohash_encoded", how="left")
-    test_fe = test_fe.merge(geo_stats, on="geohash_encoded", how="left")
-
-    for c in ["geo_demand_mean", "geo_demand_std", "geo_demand_median",
-              "geo_demand_min", "geo_demand_max", "geo_count"]:
-        test_fe[c] = test_fe[c].fillna(train_fe[c].median())
-
-    geo4_stats = train_fe.groupby("geohash_prefix4_encoded")["_target"].agg(
-        ["mean", "std"]
-    ).reset_index()
-    geo4_stats.columns = ["geohash_prefix4_encoded", "geo4_demand_mean", "geo4_demand_std"]
-    geo4_stats["geo4_demand_std"] = geo4_stats["geo4_demand_std"].fillna(0)
-
-    train_fe = train_fe.merge(geo4_stats, on="geohash_prefix4_encoded", how="left")
-    test_fe = test_fe.merge(geo4_stats, on="geohash_prefix4_encoded", how="left")
-    for c in ["geo4_demand_mean", "geo4_demand_std"]:
-        test_fe[c] = test_fe[c].fillna(train_fe[c].median())
-
-    geo5_stats = train_fe.groupby("geohash_prefix5_encoded")["_target"].agg(
-        ["mean", "std"]
-    ).reset_index()
-    geo5_stats.columns = ["geohash_prefix5_encoded", "geo5_demand_mean", "geo5_demand_std"]
-    geo5_stats["geo5_demand_std"] = geo5_stats["geo5_demand_std"].fillna(0)
-
-    train_fe = train_fe.merge(geo5_stats, on="geohash_prefix5_encoded", how="left")
-    test_fe = test_fe.merge(geo5_stats, on="geohash_prefix5_encoded", how="left")
-    for c in ["geo5_demand_mean", "geo5_demand_std"]:
-        test_fe[c] = test_fe[c].fillna(train_fe[c].median())
-
-    day_geo_stats = train_fe.groupby(["day", "geohash_encoded"])["_target"].agg(
-        ["mean"]
-    ).reset_index()
-    day_geo_stats.columns = ["day", "geohash_encoded", "day_geo_demand_mean"]
-
-    train_fe = train_fe.merge(day_geo_stats, on=["day", "geohash_encoded"], how="left")
+    # 1. geohash_encoded
+    gh_stats, gh_cols = calc_oof_stats(["geohash_encoded"], ["mean", "std", "median", "min", "max", "count"], "geo_demand")
+    test_fe = test_fe.merge(gh_stats, on=["geohash_encoded"], how="left")
+    
+    # 2. geohash_prefix4_encoded
+    gh4_stats, gh4_cols = calc_oof_stats(["geohash_prefix4_encoded"], ["mean", "std"], "geo4_demand")
+    test_fe = test_fe.merge(gh4_stats, on=["geohash_prefix4_encoded"], how="left")
+    
+    # 3. geohash_prefix5_encoded
+    gh5_stats, gh5_cols = calc_oof_stats(["geohash_prefix5_encoded"], ["mean", "std"], "geo5_demand")
+    test_fe = test_fe.merge(gh5_stats, on=["geohash_prefix5_encoded"], how="left")
+    
+    # 4. RoadType_encoded
+    road_stats, road_cols = calc_oof_stats(["RoadType_encoded"], ["mean", "std"], "road_demand")
+    test_fe = test_fe.merge(road_stats, on=["RoadType_encoded"], how="left")
+    
+    # 5. Day & Geohash Interaction
+    day_geo_stats, day_geo_cols = calc_oof_stats(["day", "geohash_encoded"], ["mean"], "day_geo_demand")
     test_fe = test_fe.merge(day_geo_stats, on=["day", "geohash_encoded"], how="left")
-    test_fe["day_geo_demand_mean"] = test_fe["day_geo_demand_mean"].fillna(
-        test_fe["geo_demand_mean"]
-    )
 
-    road_stats = train_fe.groupby("RoadType_encoded")["_target"].agg(["mean", "std"]).reset_index()
-    road_stats.columns = ["RoadType_encoded", "road_demand_mean", "road_demand_std"]
-
-    train_fe = train_fe.merge(road_stats, on="RoadType_encoded", how="left")
-    test_fe = test_fe.merge(road_stats, on="RoadType_encoded", how="left")
-    for c in ["road_demand_mean", "road_demand_std"]:
-        test_fe[c] = test_fe[c].fillna(train_fe[c].median())
-
+    # 6. Advanced Temporal/Spatial Interactions
+    adv_interactions = [
+        (["geohash_encoded", "hour"], ["mean", "count"], "hour_geo"),
+        (["geohash_encoded", "is_rush_hour"], ["mean"], "rush_geo"),
+        (["geohash_encoded", "Weather_encoded"], ["mean"], "weather_geo"),
+        (["geohash_encoded", "day_of_week"], ["mean"], "dow_geo")
+    ]
+    adv_all_cols = []
+    for group_cols, stat_funcs, prefix in adv_interactions:
+        adv_stats, adv_cols = calc_oof_stats(group_cols, stat_funcs, prefix)
+        test_fe = test_fe.merge(adv_stats, on=group_cols, how="left")
+        adv_all_cols.extend(adv_cols)
+        
+    all_stat_cols = gh_cols + gh4_cols + gh5_cols + road_cols + day_geo_cols + adv_all_cols
+    for c in all_stat_cols:
+        if "std" in c:
+            train_fe[c] = train_fe[c].fillna(0)
+            test_fe[c] = test_fe[c].fillna(0)
+        else:
+            train_fe[c] = train_fe[c].fillna(global_median)
+            test_fe[c] = test_fe[c].fillna(train_fe[c].median())
+            
+    test_fe["day_geo_demand_mean"] = test_fe["day_geo_demand_mean"].fillna(test_fe["geo_demand_mean"])
     train_fe = train_fe.drop(columns=["_target"])
 
     return train_fe, test_fe
@@ -215,7 +224,7 @@ def cross_validate_lgb(X, y, params, n_folds=N_FOLDS):
         )
 
         preds = model.predict(X_val)
-        preds = np.clip(preds, 0, None)
+        preds = np.clip(preds, 0, 1.0)
         oof_preds[val_idx] = preds
         score = r2_score(y_val, preds)
         scores.append(score)
@@ -246,7 +255,7 @@ def cross_validate_xgb(X, y, params, n_folds=N_FOLDS):
         )
 
         preds = model.predict(dval)
-        preds = np.clip(preds, 0, None)
+        preds = np.clip(preds, 0, 1.0)
         oof_preds[val_idx] = preds
         score = r2_score(y_val, preds)
         scores.append(score)
@@ -276,7 +285,7 @@ def cross_validate_cat(X, y, params, n_folds=N_FOLDS):
         )
 
         preds = model.predict(X_val)
-        preds = np.clip(preds, 0, None)
+        preds = np.clip(preds, 0, 1.0)
         oof_preds[val_idx] = preds
         score = r2_score(y_val, preds)
         scores.append(score)
@@ -308,8 +317,8 @@ def train_full_lgb(X, y, X_test, params, n_folds=N_FOLDS):
         oof_preds[val_idx] = model.predict(X_val)
         test_preds += model.predict(X_test) / n_folds
 
-    oof_preds = np.clip(oof_preds, 0, None)
-    test_preds = np.clip(test_preds, 0, None)
+    oof_preds = np.clip(oof_preds, 0, 1.0)
+    test_preds = np.clip(test_preds, 0, 1.0)
     return oof_preds, test_preds
 
 
@@ -338,8 +347,8 @@ def train_full_xgb(X, y, X_test, params, n_folds=N_FOLDS):
         oof_preds[val_idx] = model.predict(dval)
         test_preds += model.predict(dtest) / n_folds
 
-    oof_preds = np.clip(oof_preds, 0, None)
-    test_preds = np.clip(test_preds, 0, None)
+    oof_preds = np.clip(oof_preds, 0, 1.0)
+    test_preds = np.clip(test_preds, 0, 1.0)
     return oof_preds, test_preds
 
 
@@ -366,8 +375,8 @@ def train_full_cat(X, y, X_test, params, n_folds=N_FOLDS):
         oof_preds[val_idx] = model.predict(X_val)
         test_preds += model.predict(X_test) / n_folds
 
-    oof_preds = np.clip(oof_preds, 0, None)
-    test_preds = np.clip(test_preds, 0, None)
+    oof_preds = np.clip(oof_preds, 0, 1.0)
+    test_preds = np.clip(test_preds, 0, 1.0)
     return oof_preds, test_preds
 
 
@@ -472,23 +481,34 @@ def optimize_cat(X, y, n_trials=30):
     return best_params, study.best_value
 
 
-def find_best_weights(oof_lgb, oof_xgb, oof_cat, y):
-    best_r2 = -np.inf
-    best_weights = (1/3, 1/3, 1/3)
+def train_meta_learner(oof_lgb, oof_xgb, oof_cat, test_lgb, test_xgb, test_cat, train_fe, test_fe, target):
+    meta_train = np.column_stack([oof_lgb, oof_xgb, oof_cat])
+    meta_test = np.column_stack([test_lgb, test_xgb, test_cat])
 
-    for w1 in np.arange(0.1, 0.8, 0.05):
-        for w2 in np.arange(0.1, 0.8 - w1, 0.05):
-            w3 = 1.0 - w1 - w2
-            if w3 < 0.05:
-                continue
-            ensemble = w1 * oof_lgb + w2 * oof_xgb + w3 * oof_cat
-            ensemble = np.clip(ensemble, 0, None)
-            r2 = r2_score(y, ensemble)
-            if r2 > best_r2:
-                best_r2 = r2
-                best_weights = (w1, w2, w3)
+    important_feats = ["geohash_encoded_target_mean", "geo_demand_mean", "time_minutes"]
+    for feat in important_feats:
+        if feat in train_fe.columns:
+            meta_train = np.column_stack([meta_train, train_fe[feat].values])
+            meta_test = np.column_stack([meta_test, test_fe[feat].values])
 
-    return best_weights, best_r2
+    meta_model = Ridge(alpha=1.0, random_state=SEED)
+    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    oof_preds = np.zeros(len(meta_train))
+    final_test_preds = np.zeros(len(meta_test))
+
+    for tr_idx, val_idx in kf.split(meta_train):
+        X_tr, X_val = meta_train[tr_idx], meta_train[val_idx]
+        y_tr = target.iloc[tr_idx]
+
+        meta_model.fit(X_tr, y_tr)
+        oof_preds[val_idx] = meta_model.predict(X_val)
+        final_test_preds += meta_model.predict(meta_test) / N_FOLDS
+
+    oof_preds = np.clip(oof_preds, 0, 1.0)
+    final_test_preds = np.clip(final_test_preds, 0, 1.0)
+
+    ensemble_r2 = r2_score(target, oof_preds)
+    return oof_preds, final_test_preds, ensemble_r2
 
 
 def main():
@@ -534,15 +554,11 @@ def main():
     cat_r2 = r2_score(target, oof_cat)
     print(f"  CAT OOF R2: {cat_r2:.6f} (Scaled: {max(0, 100 * cat_r2):.2f})")
 
-    print("\n[7/7] Finding optimal ensemble weights...")
-    best_weights, ensemble_r2 = find_best_weights(oof_lgb, oof_xgb, oof_cat, target)
-    print(f"  Weights -> LGB: {best_weights[0]:.2f}, XGB: {best_weights[1]:.2f}, CAT: {best_weights[2]:.2f}")
+    print("\n[7/7] Training Stacking Meta-Learner...")
+    oof_ensemble, final_preds, ensemble_r2 = train_meta_learner(
+        oof_lgb, oof_xgb, oof_cat, test_lgb, test_xgb, test_cat, train_fe, test_fe, target
+    )
     print(f"  Ensemble OOF R2: {ensemble_r2:.6f} (Scaled: {max(0, 100 * ensemble_r2):.2f})")
-
-    final_preds = (best_weights[0] * test_lgb +
-                   best_weights[1] * test_xgb +
-                   best_weights[2] * test_cat)
-    final_preds = np.clip(final_preds, 0, None)
 
     submission = pd.DataFrame({
         "Index": test_idx.values,
@@ -559,7 +575,6 @@ def main():
         "xgb_r2": xgb_r2,
         "cat_r2": cat_r2,
         "ensemble_r2": ensemble_r2,
-        "best_weights": list(best_weights),
         "features": features,
         "n_features": len(features),
     }
