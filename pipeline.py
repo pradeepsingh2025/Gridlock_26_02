@@ -402,7 +402,13 @@ def optimize_lgb(X, y, n_trials=40):
         r2, _, _ = cross_validate_lgb(X, y, params)
         return r2
 
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=SEED))
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=SEED),
+        storage="sqlite:///optuna_study.db",
+        study_name="lgb_study",
+        load_if_exists=True
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     best_params = study.best_params
     best_params.update({
@@ -437,7 +443,13 @@ def optimize_xgb(X, y, n_trials=40):
         r2, _, _ = cross_validate_xgb(X, y, params)
         return r2
 
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=SEED))
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=SEED),
+        storage="sqlite:///optuna_study.db",
+        study_name="xgb_study",
+        load_if_exists=True
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     best_params = study.best_params
     best_params.update({
@@ -468,7 +480,13 @@ def optimize_cat(X, y, n_trials=30):
         r2, _, _ = cross_validate_cat(X, y, params)
         return r2
 
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=SEED))
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=SEED),
+        storage="sqlite:///optuna_study.db",
+        study_name="cat_study",
+        load_if_exists=True
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     best_params = study.best_params
     best_params.update({
